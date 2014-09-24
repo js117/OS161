@@ -1,0 +1,48 @@
+The toughest technical situation I've dealt with in my Operating Systems project is virtual memory management on a RAM-constrained system. In this particular scenario I was limited to 512KB RAM, and had to run programs that forked off many child processes. 
+
+========================================
+=== Quick overview of virtual memory ===
+========================================
+
+Each process has a full 32- (or 64-) bit address space in which it can create and reference variables, and hold its own code. The reality is that physical existing memory (RAM) cannot possibly accomodate a 32-bit address space per process; that's 4GB per process, so at 10 processes you would need 40GB of RAM. Instead what we do is use a page table, which is a mapping from pages of the virtual memory space of a process to physical RAM. 
+
+Image: http://upload.wikimedia.org/wikipedia/commons/thumb/3/32/Virtual_address_space_and_physical_address_space_relationship.svg/300px-Virtual_address_space_and_physical_address_space_relationship.svg.png
+
+When the operating system does a context switch to another process, the appropriate page table must be referenced to find the corresponding page of memory in RAM. For example, multiple processes can have a local variable, 
+
+float bankAccountBalance; //e.g. each process' virtual memory has it at location 0x10004F00
+
+But they will exist in different places in RAM. In traditional virtual memory management systems, a per-process page table is used to create the mappings from virtual pages to physical RAM pages. However on a RAM-constrained system (such as an embedded device) this may be too limiting. Page tables take up pages of RAM themselves, after all. 
+
+===============================
+=== The Inverted Page Table ===
+===============================
+
+An inverted page table (IPT) attempts to resolve this problem by handling the mapping in reverse: for every page of RAM (physical page), save which virtual page (VPN) of which process ID (PID) is mapped there. This is the opposite of the traditional structure, whereby each process keeps track of which physical pages it has, now each physical page keeps track of what virtual page inhabits it. 
+
+This is more space efficient because there are always less physical pages (amount of RAM) than the possible virtual address space. In a 64-bit OS, the possible address space is 2^64 bits = over 2 billion GB. 
+
+A space comparison. Say we have a 32-bit OS system with 512KB of RAM, at 4KB per page. We have 128 pages of RAM. In the traditional system, each process would need at least 1 page to hold its page table, even with the multi-level spare tree structure. At 50 processes, we're losing 50/128 = 39% of our RAM taken up just for holding these mappings! With the IPT, we need just 1 page to hold 128 mappings at any given time (< 1% overhead). 
+
+The problem with IPTs: looking up mappings in the IPT may not be time efficient. In the traditional system, even when multi-layered as a tree, the lookup mapping from virtual to physical page is constant time. With the IPT, for every page of RAM we need to look to find the given VPN/PID combination the code is referencing, a linear search at worst. 
+
+(Quick aside - for the purposes of this project, a linear search of 128 entries did not hamper performance. However I wanted a solution I could replicate in other systems.) 
+
+My solution was to turn the IPT into a hash table. For a given VPN/PID combination, there are 20 (virtual page number is 32 bits - 12 bits of page offset) + 10 bits for the PID (allowing 1024 processes at any time) = 30 bits. These 30 bits form a unique number of which I applied a hash function to determine where in the 128 IPT entries it would fit. The actual hash function I used - found through trial and error for best performance - involved adding a number ("salting") and then doing modulus 127. It's always better to hash by prime numbers (this reduces the number of collisions on average, see: http://stackoverflow.com/questions/1145217/why-should-hash-functions-use-a-prime-number-modulus). 
+
+The next issue to deal with is collisions - what happens when another int placement = hash(VPN,PID) matches a taken index in the IPT? I tried two solutions:
+
+1. On collision, take the placement value and do a linear hash downwards, i.e. try placement + 1, placement + 2, ... until a match is found. Quadratic hashing also can work well, i.e. try placement + 1, placement + 4, placement + 9, ... The idea is to reduce further collisions. With quadratic hashing there is the possibility that you run off the list and still don't find a spot, in which case you can go back to trying placement = 0 and doing a linear hash. 
+
+2. The IPT already has a huge space advantage, let's leverage that by sacrificing a bit of space usage for guaranteed constant time look-up. This assumes collisions are rare, and the number of collisions at a particular placement is orders of magnitude less than the size of the IPT. This solution is called chaining: at every placement causing a collision, create a linked list and append collision entries (VPN/PID combos) to this list. 
+
+I found solution #2 to be more interesting and on average faster than #1 for my particular IPT size (as measured in clock cycles). The underlying assumption - which proved true in practice - was that on collision a linear search of entries colliding is a constant-time operation because that list is so small. I remember seeing 5 collisions at worse in a particular hash location, meaning a linear search of a list 4% of N (N = 128) which for all intents and purposes is constant-time.
+
+Why a linked list over an array? Because insertions and deletions are constant-time operations (re-point the pointers). I don't have to preallocate an array size, which will either be too little (waste time in the future resizing and copying when needed, including shifting on deletion) or too large, causing wasted space. 
+
+An interesting aside, to really optimize I would do studies on cache performance on reading these small linked lists / arrays to check speed lookup. Arrays are contiguous in memory leading to better spatial locality. Linked list entries are malloc'd on the fly and in general won't be contiguous, causing more cache misses on reads. It might be the case that arrays are so much faster on average for lookup that we can amortize (or "ignore") the resizing costs. Or even suffer the space penalty by conservatively over-allocating each collision storage array. I think all good algorithm design involves tradeoffs, and more information considered, including more experiements run, will lead to the appropriate solution for the task at hand. 
+
+Wrapping up solution #2, an additional page of kernel (OS) memory was used to hold the collision linked lists. Now the IPT solution involves 2/128 pages of RAM (1.6% overhead) and practically guarantees constant time VPN/physical page translation lookup. Not too shabby.       
+
+
+- J.S.
